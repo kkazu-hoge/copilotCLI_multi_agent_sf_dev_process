@@ -1178,9 +1178,1058 @@ bash .github/skills/salesforce-fls-security/scripts/scan-fls-compliance.sh force
 - WITH USER_MODE / SECURITY_ENFORCED / stripInaccessible の詳細コード例 → `reference/fls-patterns.md`
 ```
 
-### 7-4 〜 7-6（残りのSkills）
+### 7-4. salesforce-bulk-patterns SKILL.md
 
-`salesforce-bulk-patterns`, `salesforce-lwc-patterns`, `salesforce-test-patterns` も同様に、instructions/ に記載済みの基本ルールと重複させず、判断フロー・具体的コード例・リファレンスへの誘導に特化して構成する。テンプレートの詳細構造は `01_architecture.md` セクション3.3を参照。
+```markdown
+---
+description: >
+  バルク化パターンの具体的な適用方法やリファクタリング判断が必要な場合に使用せよ。
+  基本原則（ループ内SOQL/DML禁止等）は instructions/apex-coding.instructions.md で自動適用されるため、
+  本スキルは「どのバルク化パターンを適用するか」の選定・設計判断が必要な場面で参照すること。
+  「N+1クエリの修正方法」「Map化パターンの適用」「Selectorパターン設計」「UnitOfWorkパターン」
+  「トリガのバルク化リファクタリング」「コレクション操作の最適化」等のキーワードが出たら即座にロード。
+  単純な「ループ内SOQLは禁止」の知識だけで済む場合は不要。
+---
+
+# バルク化パターン — 選定フロー・適用ガイド
+
+## バルク化パターン選定フロー
+
+### データ取得（SOQL）のバルク化
+
+```
+関連データの取得方法を選定:
+├─ 単一オブジェクト → 呼び出し前に一括取得 + Map化
+│   ├─ IDで引く → Map<Id, SObject>
+│   └─ 外部キーで引く → Map<String, SObject>（外部ID/一意項目）
+├─ 親→子の関連 → サブクエリ（Nested SOQL）
+│   └─ SELECT Id, (SELECT Id FROM Contacts) FROM Account
+├─ 子→親の関連 → リレーション参照（ドット表記）
+│   └─ SELECT Id, Account.Name FROM Contact
+└─ 複数オブジェクト横断 → Selector クラスに集約
+    └─ AccountSelector.getByIdsWithContacts(accountIds)
+```
+
+### データ更新（DML）のバルク化
+
+```
+DML対象の蓄積方法を選定:
+├─ 単一オブジェクトの更新 → List に蓄積 → ループ後に一括DML
+├─ 複数オブジェクトの関連更新 → UnitOfWork パターン
+│   ├─ 登録順序の依存関係あり → registerNew() で順序制御
+│   └─ 依存関係なし → 各Listに蓄積 → 順次DML
+└─ 部分成功を許容する場合 → Database.insert(records, false) + エラーハンドリング
+```
+
+## 代表的なパターン
+
+### パターン1: Map化パターン（最頻出）
+
+**Before（NG — ループ内SOQL）:**
+```apex
+for (Opportunity opp : Trigger.new) {
+    // ❌ ループ内SOQL
+    Account acc = [SELECT Id, Industry FROM Account WHERE Id = :opp.AccountId];
+    if (acc.Industry == 'Technology') { /* ... */ }
+}
+```
+
+**After（OK — Map化）:**
+```apex
+// ループ前に一括取得
+Set<Id> accountIds = new Set<Id>();
+for (Opportunity opp : Trigger.new) {
+    accountIds.add(opp.AccountId);
+}
+Map<Id, Account> accountMap = new Map<Id, Account>(
+    [SELECT Id, Industry FROM Account WHERE Id IN :accountIds]
+);
+
+// ループ内はMapから参照（SOQLなし）
+for (Opportunity opp : Trigger.new) {
+    Account acc = accountMap.get(opp.AccountId);
+    if (acc != null && acc.Industry == 'Technology') { /* ... */ }
+}
+```
+
+### パターン2: DML蓄積パターン
+
+**Before（NG — ループ内DML）:**
+```apex
+for (Account acc : targetAccounts) {
+    acc.Score__c = calculateScore(acc);
+    // ❌ ループ内DML
+    update acc;
+}
+```
+
+**After（OK — List蓄積 + 一括DML）:**
+```apex
+List<Account> accountsToUpdate = new List<Account>();
+for (Account acc : targetAccounts) {
+    acc.Score__c = calculateScore(acc);
+    accountsToUpdate.add(acc);
+}
+// ループ外で一括DML
+if (!accountsToUpdate.isEmpty()) {
+    update accountsToUpdate;
+}
+```
+
+### パターン3: Selector パターン（SOQL集約）
+
+```apex
+public class AccountSelector {
+    public static List<Account> getByIds(Set<Id> accountIds) {
+        return [
+            SELECT Id, Name, Industry, AnnualRevenue, Score__c
+            FROM Account
+            WHERE Id IN :accountIds
+            WITH USER_MODE
+        ];
+    }
+
+    public static List<Account> getByIdsWithContacts(Set<Id> accountIds) {
+        return [
+            SELECT Id, Name, Industry,
+                   (SELECT Id, Name, Email FROM Contacts)
+            FROM Account
+            WHERE Id IN :accountIds
+            WITH USER_MODE
+        ];
+    }
+
+    public static Map<Id, Account> getMapByIds(Set<Id> accountIds) {
+        return new Map<Id, Account>(getByIds(accountIds));
+    }
+}
+```
+
+### パターン4: UnitOfWork パターン（複数オブジェクトDML集約）
+
+```apex
+public class UnitOfWork {
+    private List<SObject> newRecords = new List<SObject>();
+    private List<SObject> updatedRecords = new List<SObject>();
+    private List<SObject> deletedRecords = new List<SObject>();
+
+    public void registerNew(SObject record) {
+        newRecords.add(record);
+    }
+
+    public void registerDirty(SObject record) {
+        updatedRecords.add(record);
+    }
+
+    public void registerDeleted(SObject record) {
+        deletedRecords.add(record);
+    }
+
+    public void commitWork() {
+        Savepoint sp = Database.setSavepoint();
+        try {
+            if (!newRecords.isEmpty())     insert newRecords;
+            if (!updatedRecords.isEmpty()) update updatedRecords;
+            if (!deletedRecords.isEmpty()) delete deletedRecords;
+        } catch (Exception e) {
+            Database.rollback(sp);
+            throw e;
+        }
+    }
+}
+```
+
+### パターン5: Trigger Handler のバルク化テンプレート
+
+```apex
+public class AccountTriggerHandler {
+
+    public void handleAfterUpdate(
+        List<Account> newList,
+        Map<Id, Account> oldMap
+    ) {
+        List<Account> scoreChangedAccounts = new List<Account>();
+        Set<Id> ownerIds = new Set<Id>();
+
+        // 1. 対象レコードの絞り込み + 関連ID収集
+        for (Account acc : newList) {
+            Account oldAcc = oldMap.get(acc.Id);
+            if (acc.Score__c != oldAcc.Score__c) {
+                scoreChangedAccounts.add(acc);
+                ownerIds.add(acc.OwnerId);
+            }
+        }
+
+        if (scoreChangedAccounts.isEmpty()) return;
+
+        // 2. 関連データの一括取得
+        Map<Id, User> ownerMap = new Map<Id, User>(
+            [SELECT Id, Email, Name FROM User WHERE Id IN :ownerIds]
+        );
+
+        // 3. 処理実行（ループ内にSOQL/DMLなし）
+        List<Task> tasksToInsert = new List<Task>();
+        for (Account acc : scoreChangedAccounts) {
+            User owner = ownerMap.get(acc.OwnerId);
+            tasksToInsert.add(new Task(
+                WhatId = acc.Id,
+                OwnerId = acc.OwnerId,
+                Subject = 'スコア変更確認: ' + acc.Name,
+                Status = 'Not Started'
+            ));
+        }
+
+        // 4. 一括DML
+        if (!tasksToInsert.isEmpty()) {
+            insert tasksToInsert;
+        }
+    }
+}
+```
+
+## リファクタリング判断フロー
+
+```
+既存コードにガバナ制限違反の疑いがある場合:
+│
+├─ scan-governor-violations.sh を実行して違反候補を特定
+│
+├─ 違反箇所がトリガ内 →
+│   ├─ ループ内SOQL → Map化パターン（パターン1）を適用
+│   ├─ ループ内DML → DML蓄積パターン（パターン2）を適用
+│   └─ 複数オブジェクトDML → UnitOfWorkパターン（パターン4）を適用
+│
+├─ 違反箇所がService層 →
+│   ├─ 複数箇所で同じSOQL → Selectorパターン（パターン3）に集約
+│   └─ 計算ロジック内のSOQL → 呼び出し元で事前取得してパラメータ渡し
+│
+└─ データ量増加による将来的なリスク →
+    ├─ 現在は少量だが増加見込み → Batchable化を設計に組み込む
+    └─ 件数が不定 → Queueable で動的にチェーン数を調整
+```
+
+## 詳細リファレンスへの誘導
+
+- Trigger / Batch / Queueable の完全なバルク化コード例 → `reference/bulk-code-examples.md`
+- ガバナ制限の具体値と回避パターン → `../salesforce-governor-limits/SKILL.md`
+```
+
+#### ディレクトリ構成
+
+```
+.github/skills/salesforce-bulk-patterns/
+├── SKILL.md                        # 上記の内容（約250行）
+└── reference/
+    └── bulk-code-examples.md       # 以下の構成で詳細コード例を収録
+```
+
+#### reference/bulk-code-examples.md の構成
+
+```markdown
+# バルク化パターン — 詳細コード例リファレンス
+
+## 1. Trigger バルク化の完全例
+
+### 1.1 Before Insert — デフォルト値の一括設定
+### 1.2 After Insert — 関連レコードの一括作成
+### 1.3 Before Update — 変更検知 + 関連データ参照
+### 1.4 After Update — 条件付き非同期処理の起動
+### 1.5 Before Delete — 削除可否の一括チェック
+
+## 2. Batch Apex のバルク化パターン
+
+### 2.1 基本構成（Batchable + Schedulable）
+### 2.2 外部連携を含む Batch（scope調整 + コールアウト）
+### 2.3 チェーンBatch（Batch完了後に次のBatchを起動）
+### 2.4 部分成功 + エラーログ記録パターン
+
+## 3. Queueable のバルク化パターン
+
+### 3.1 基本構成（単発Queueable）
+### 3.2 チェーンQueueable（再帰的enqueue）
+### 3.3 Queueable + Finalizer（エラー時リトライ）
+
+## 4. コレクション操作の最適化
+
+### 4.1 Set を使った重複排除
+### 4.2 Map のマージ・フィルタリング
+### 4.3 ネストMap（Map<Id, Map<String, Object>>）の活用
+```
+
+---
+
+### 7-5. salesforce-lwc-patterns SKILL.md
+
+```markdown
+---
+description: >
+  LWCのデータアクセスパターン選定、コンポーネント間通信設計、またはパフォーマンス最適化の
+  詳細判断が必要な場合に使用せよ。
+  基本ルール（Wire優先、SLDS準拠等）は instructions/lwc-coding.instructions.md で自動適用されるため、
+  本スキルは「どのパターンを使い分けるか」の具体的な判断が必要な場面で参照すること。
+  「@wire vs imperative」「LDS vs カスタムApex」「子→親イベント通信」
+  「Lightning Message Service」「データテーブルのページネーション」
+  「コンポーネント分割設計」「SLDS レイアウト設計」等のキーワードが出たら即座にロード。
+  単純なLWCの構文確認だけの場合は不要。
+---
+
+# LWC パターン — データアクセス・通信設計ガイド
+
+## データアクセスパターン選定フロー
+
+```
+画面に表示するデータの取得方法を選定:
+│
+├─ 単一レコードの標準項目のみ →
+│   └─ Lightning Data Service（LDS）
+│       ├─ 参照のみ → lightning-record-view-form
+│       ├─ 編集あり → lightning-record-edit-form
+│       └─ プログラム制御 → getRecord / updateRecord（@wire）
+│
+├─ 単一レコード + カスタムロジック →
+│   └─ @wire + Apex メソッド
+│       └─ @AuraEnabled(cacheable=true) で取得
+│
+├─ 複数レコードの一覧表示 →
+│   ├─ 標準リスト → lightning-datatable + @wire Apex
+│   ├─ 検索付き一覧 → imperative Apex（ユーザー操作起点）
+│   └─ 無限スクロール/ページネーション → カーソルベース + imperative
+│
+├─ ユーザー操作による更新 →
+│   ├─ 標準DML → LDS updateRecord / createRecord
+│   └─ カスタムロジック付きDML → imperative Apex
+│       └─ @AuraEnabled(cacheable=false) で更新
+│
+└─ リアルタイム更新通知 →
+    ├─ 同一レコードの変更検知 → getRecord の自動リフレッシュ
+    ├─ 他ユーザーの変更通知 → emp API（Platform Event / CDC）
+    └─ 他コンポーネントからの通知 → Lightning Message Service
+```
+
+## コンポーネント間通信パターン選定フロー
+
+```
+コンポーネント間のデータ受け渡し方法を選定:
+│
+├─ 親 → 子 →
+│   └─ @api プロパティ（単方向データフロー）
+│       └─ 子は受け取ったデータを直接変更しない（immutable原則）
+│
+├─ 子 → 親 →
+│   └─ CustomEvent をディスパッチ
+│       ├─ バブリングなし（直接の親のみ）→ bubbles: false（デフォルト）
+│       └─ 祖先まで伝播 → bubbles: true, composed: true
+│
+├─ 兄弟コンポーネント →
+│   ├─ 共通の親を経由 → 子A --CustomEvent--> 親 --@api--> 子B
+│   └─ 親子関係なし → Lightning Message Service（LMS）
+│
+└─ 完全に独立したコンポーネント →
+    └─ Lightning Message Service（LMS）
+        ├─ メッセージチャネル定義（.messageChannel-meta.xml）
+        ├─ publish() で送信
+        └─ subscribe() で受信
+```
+
+## 代表的なパターン
+
+### パターン1: @wire + Apex（キャッシュ有効な読み取り）
+
+```javascript
+import { LightningElement, api, wire } from 'lwc';
+import getAccountScore from '@salesforce/apex/ScoreDashboardController.getAccountScore';
+
+export default class AccountScoreCard extends LightningElement {
+    @api recordId;
+    score;
+    error;
+
+    @wire(getAccountScore, { accountId: '$recordId' })
+    wiredScore({ data, error }) {
+        if (data) {
+            this.score = data;
+            this.error = undefined;
+        } else if (error) {
+            this.error = error;
+            this.score = undefined;
+        }
+    }
+}
+```
+
+### パターン2: Imperative Apex（ユーザー操作起点）
+
+```javascript
+import { LightningElement, api } from 'lwc';
+import recalculateScore from '@salesforce/apex/ScoreDashboardController.recalculateScore';
+import { ShowToastEvent } from 'lightning/platformShowToastEvent';
+
+export default class ScoreRecalculator extends LightningElement {
+    @api recordId;
+    isLoading = false;
+
+    async handleRecalculate() {
+        this.isLoading = true;
+        try {
+            const result = await recalculateScore({ accountId: this.recordId });
+            this.dispatchEvent(new ShowToastEvent({
+                title: '成功',
+                message: `スコアが ${result.score} に更新されました`,
+                variant: 'success'
+            }));
+            // 親コンポーネントに変更を通知
+            this.dispatchEvent(new CustomEvent('scoreupdate', {
+                detail: { score: result.score }
+            }));
+        } catch (error) {
+            this.dispatchEvent(new ShowToastEvent({
+                title: 'エラー',
+                message: error.body?.message || '予期しないエラーが発生しました',
+                variant: 'error'
+            }));
+        } finally {
+            this.isLoading = false;
+        }
+    }
+}
+```
+
+### パターン3: 親子通信（@api + CustomEvent）
+
+```javascript
+// 親コンポーネント（scoreContainer.js）
+import { LightningElement, api } from 'lwc';
+
+export default class ScoreContainer extends LightningElement {
+    @api recordId;
+    selectedGrade = 'ALL';
+
+    handleFilterChange(event) {
+        this.selectedGrade = event.detail.grade;
+    }
+}
+```
+
+```html
+<!-- 親コンポーネント（scoreContainer.html） -->
+<template>
+    <c-score-filter onfilterchange={handleFilterChange}></c-score-filter>
+    <c-score-list record-id={recordId} grade-filter={selectedGrade}></c-score-list>
+</template>
+```
+
+```javascript
+// 子コンポーネント（scoreFilter.js）
+import { LightningElement } from 'lwc';
+
+export default class ScoreFilter extends LightningElement {
+    handleGradeSelect(event) {
+        this.dispatchEvent(new CustomEvent('filterchange', {
+            detail: { grade: event.target.value }
+        }));
+    }
+}
+```
+
+### パターン4: エラーハンドリング統一パターン
+
+```javascript
+import { LightningElement } from 'lwc';
+import { ShowToastEvent } from 'lightning/platformShowToastEvent';
+import { reduceErrors } from 'c/ldsUtils';
+
+export default class BaseComponent extends LightningElement {
+
+    showError(error) {
+        const messages = reduceErrors(error);
+        this.dispatchEvent(new ShowToastEvent({
+            title: 'エラー',
+            message: messages.join(', '),
+            variant: 'error',
+            mode: 'sticky'
+        }));
+    }
+
+    showSuccess(message) {
+        this.dispatchEvent(new ShowToastEvent({
+            title: '成功',
+            message: message,
+            variant: 'success'
+        }));
+    }
+}
+```
+
+### パターン5: デバウンス付き検索入力
+
+```javascript
+import { LightningElement } from 'lwc';
+import searchAccounts from '@salesforce/apex/AccountSearchController.search';
+
+const DEBOUNCE_DELAY = 300;
+
+export default class AccountSearch extends LightningElement {
+    searchTerm = '';
+    results = [];
+    isLoading = false;
+    _debounceTimer;
+
+    handleSearchInput(event) {
+        clearTimeout(this._debounceTimer);
+        this.searchTerm = event.target.value;
+
+        if (this.searchTerm.length < 2) {
+            this.results = [];
+            return;
+        }
+
+        this._debounceTimer = setTimeout(() => {
+            this.performSearch();
+        }, DEBOUNCE_DELAY);
+    }
+
+    async performSearch() {
+        this.isLoading = true;
+        try {
+            this.results = await searchAccounts({ searchTerm: this.searchTerm });
+        } catch (error) {
+            this.results = [];
+        } finally {
+            this.isLoading = false;
+        }
+    }
+}
+```
+
+## コンポーネント分割の判断基準
+
+```
+コンポーネントを分割すべきか判断:
+│
+├─ HTML が 200行を超える → 分割を検討
+├─ 独立して再利用できるUI部品がある → 子コンポーネントに分離
+├─ 異なる更新頻度のセクションがある → 分割して再レンダリング範囲を限定
+├─ テスト容易性を高めたい → ロジックを持つ部分を分離
+└─ 上記いずれにも該当しない → 分割不要（過度な分割は複雑性を増す）
+```
+
+## 詳細リファレンスへの誘導
+
+- LDS / @wire / imperative / LMS の詳細コード例 → `reference/lwc-code-examples.md`
+- LWCパフォーマンス方針 → `docs/architecture/policies/performance-policy.md` セクション5
+```
+
+#### ディレクトリ構成
+
+```
+.github/skills/salesforce-lwc-patterns/
+├── SKILL.md                        # 上記の内容（約250行）
+└── reference/
+    └── lwc-code-examples.md        # 以下の構成で詳細コード例を収録
+```
+
+#### reference/lwc-code-examples.md の構成
+
+```markdown
+# LWC パターン — 詳細コード例リファレンス
+
+## 1. データアクセスパターンの完全例
+
+### 1.1 Lightning Data Service（レコードビュー/編集フォーム）
+### 1.2 getRecord / updateRecord によるプログラム制御
+### 1.3 @wire Apex — リアクティブパラメータ付き
+### 1.4 Imperative Apex — CRUD操作一式
+### 1.5 ページネーション（カーソルベース）
+
+## 2. コンポーネント間通信の完全例
+
+### 2.1 親子間の双方向通信（@api + CustomEvent）
+### 2.2 Lightning Message Service（LMS）のpublish/subscribe
+### 2.3 emp API による Platform Event 受信
+
+## 3. UI パターンの完全例
+
+### 3.1 lightning-datatable（ソート・インライン編集付き）
+### 3.2 モーダルダイアログ（lightning-modal）
+### 3.3 動的コンポーネント生成
+### 3.4 ドラッグ&ドロップ
+
+## 4. エラーハンドリング・ユーティリティ
+
+### 4.1 reduceErrors ユーティリティ
+### 4.2 ローディング・空状態の表示パターン
+### 4.3 権限チェック（@wire getObjectInfo / @salesforce/userPermission）
+```
+
+---
+
+### 7-6. salesforce-test-patterns SKILL.md
+
+```markdown
+---
+description: >
+  テストクラスの設計パターン選定、テストデータ戦略、または複雑なテストシナリオの実装が
+  必要な場合に使用せよ。
+  基本ルール（@TestSetup必須、SeeAllData禁止等）は instructions/test-coding.instructions.md で
+  自動適用されるため、本スキルは「どのテストパターンを使い分けるか」「テストデータをどう構築するか」
+  の詳細判断が必要な場面で参照すること。
+  「テストデータファクトリの設計」「モックの実装方法」「HttpCalloutMock」
+  「バルクテストの件数設計」「非同期テスト（Test.startTest/stopTest）」
+  「権限テスト（System.runAs）」「複合シナリオテスト」等のキーワードが出たら即座にロード。
+  単純なテストクラスの構文確認だけの場合は不要。
+---
+
+# テストパターン — 設計・実装ガイド
+
+## テスト種別の選定フロー
+
+```
+テスト対象に応じてテスト種別を選定:
+│
+├─ Apex クラス / トリガ →
+│   ├─ 正常系テスト（必須）
+│   │   ├─ 単一レコード → 基本的な入出力検証
+│   │   └─ バルク（200件以上）→ ガバナ制限内での動作検証
+│   ├─ 異常系テスト（必須）
+│   │   ├─ バリデーションルール違反 → DmlException の検証
+│   │   ├─ 必須項目未入力 → エラーメッセージの検証
+│   │   └─ 権限不足 → System.runAs でプロファイル切替
+│   ├─ 境界値テスト（推奨）
+│   │   ├─ 数値項目の最大/最小値
+│   │   └─ 文字列項目の最大長
+│   └─ セキュリティテスト（推奨）
+│       ├─ FLS違反 → 権限なしユーザーでのアクセス試行
+│       └─ 共有ルール → レコードアクセス不可ユーザーでの操作試行
+│
+├─ 外部連携（Callout）→
+│   ├─ HttpCalloutMock 実装（必須）
+│   │   ├─ 正常レスポンス → 200 / 201
+│   │   ├─ エラーレスポンス → 400 / 401 / 500
+│   │   └─ タイムアウト → CalloutException
+│   └─ Test.startTest() / Test.stopTest() で非同期実行
+│
+├─ Batch / Queueable / Schedulable →
+│   ├─ Test.startTest() / Test.stopTest() で囲む（必須）
+│   ├─ Batch → Database.executeBatch + 完了後のデータ検証
+│   ├─ Queueable → System.enqueueJob + 完了後のデータ検証
+│   └─ Schedulable → cron式でスケジュール登録の検証
+│
+└─ LWC コントローラ →
+    ├─ @AuraEnabled メソッドの直接テスト
+    └─ 例外発生時の AuraHandledException の検証
+```
+
+## テストデータ戦略
+
+### TestDataFactory の設計方針
+
+```
+テストデータの作成方法を選定:
+│
+├─ 共通のマスタデータ → @TestSetup で一括作成
+│   └─ TestDataFactory.createStandardData() を呼び出し
+│
+├─ テスト固有のデータ → 各テストメソッド内で作成
+│   └─ TestDataFactory.createAccount(overrides) でパラメータ上書き
+│
+├─ 大量データ → TestDataFactory.createAccounts(count) で一括生成
+│   └─ バルクテストには200件以上を使用
+│
+└─ 外部連携データ → HttpCalloutMock / StaticResource で模擬
+```
+
+### TestDataFactory の実装パターン
+
+```apex
+@IsTest
+public class TestDataFactory {
+
+    // === Account ===
+    public static Account createAccount() {
+        return createAccount(new Map<String, Object>());
+    }
+
+    public static Account createAccount(Map<String, Object> overrides) {
+        Account acc = new Account(
+            Name = 'Test Account',
+            Industry = 'Technology',
+            AnnualRevenue = 1000000
+        );
+        applyOverrides(acc, overrides);
+        insert acc;
+        return acc;
+    }
+
+    public static List<Account> createAccounts(Integer count) {
+        List<Account> accounts = new List<Account>();
+        for (Integer i = 0; i < count; i++) {
+            accounts.add(new Account(
+                Name = 'Test Account ' + i,
+                Industry = 'Technology'
+            ));
+        }
+        insert accounts;
+        return accounts;
+    }
+
+    // === Opportunity ===
+    public static Opportunity createOpportunity(Id accountId) {
+        return createOpportunity(accountId, new Map<String, Object>());
+    }
+
+    public static Opportunity createOpportunity(
+        Id accountId,
+        Map<String, Object> overrides
+    ) {
+        Opportunity opp = new Opportunity(
+            Name = 'Test Opportunity',
+            AccountId = accountId,
+            StageName = 'Prospecting',
+            CloseDate = Date.today().addDays(30),
+            Amount = 50000
+        );
+        applyOverrides(opp, overrides);
+        insert opp;
+        return opp;
+    }
+
+    // === ユーティリティ ===
+    public static User createUserWithProfile(String profileName) {
+        Profile p = [SELECT Id FROM Profile WHERE Name = :profileName LIMIT 1];
+        String uniqueKey = String.valueOf(Datetime.now().getTime());
+        User u = new User(
+            FirstName = 'Test',
+            LastName = 'User ' + uniqueKey,
+            Email = 'test' + uniqueKey + '@example.com',
+            Username = 'test' + uniqueKey + '@example.com.test',
+            Alias = 'tuser',
+            TimeZoneSidKey = 'Asia/Tokyo',
+            LocaleSidKey = 'ja_JP',
+            EmailEncodingKey = 'UTF-8',
+            LanguageLocaleKey = 'ja',
+            ProfileId = p.Id
+        );
+        insert u;
+        return u;
+    }
+
+    private static void applyOverrides(SObject record, Map<String, Object> overrides) {
+        for (String field : overrides.keySet()) {
+            record.put(field, overrides.get(field));
+        }
+    }
+}
+```
+
+## 代表的なテストパターン
+
+### パターン1: @TestSetup + 正常系/異常系テスト
+
+```apex
+@IsTest
+private class AccountScoringServiceTest {
+
+    @TestSetup
+    static void setup() {
+        // 共通テストデータ
+        Account acc = TestDataFactory.createAccount(new Map<String, Object>{
+            'Industry' => 'Technology',
+            'AnnualRevenue' => 5000000
+        });
+        TestDataFactory.createOpportunity(acc.Id);
+    }
+
+    @IsTest
+    static void calculateScore_validAccount_returnsExpectedScore() {
+        // Arrange
+        Account acc = [SELECT Id FROM Account LIMIT 1];
+
+        // Act
+        Test.startTest();
+        Decimal score = AccountScoringService.calculateScore(acc.Id);
+        Test.stopTest();
+
+        // Assert
+        Assert.isNotNull(score, 'スコアがnullであってはならない');
+        Assert.isTrue(score >= 0 && score <= 100, 'スコアは0-100の範囲であること');
+    }
+
+    @IsTest
+    static void calculateScore_noActivities_returnsZero() {
+        // Arrange — 活動なしのAccount
+        Account acc = TestDataFactory.createAccount(new Map<String, Object>{
+            'Name' => 'No Activity Account'
+        });
+
+        // Act
+        Test.startTest();
+        Decimal score = AccountScoringService.calculateScore(acc.Id);
+        Test.stopTest();
+
+        // Assert
+        Assert.areEqual(0, score, '活動がないAccountのスコアは0であること');
+    }
+
+    @IsTest
+    static void calculateScore_invalidId_throwsException() {
+        // Arrange
+        Id fakeId = TestUtility.getFakeId(Account.SObjectType);
+
+        // Act & Assert
+        try {
+            Test.startTest();
+            AccountScoringService.calculateScore(fakeId);
+            Test.stopTest();
+            Assert.fail('例外がスローされるべき');
+        } catch (BusinessException e) {
+            Assert.isTrue(
+                e.getMessage().contains('取引先が見つかりません'),
+                'エラーメッセージに原因が含まれること'
+            );
+        }
+    }
+}
+```
+
+### パターン2: バルクテスト
+
+```apex
+@IsTest
+static void calculateScore_bulk200_completesWithinLimits() {
+    // Arrange — 200件のAccount
+    List<Account> accounts = TestDataFactory.createAccounts(200);
+    Set<Id> accountIds = new Map<Id, Account>(accounts).keySet();
+
+    // Act
+    Test.startTest();
+    AccountScoringService.calculateScores(accountIds);
+    Test.stopTest();
+
+    // Assert — ガバナ制限内で完了していることを暗黙的に検証
+    List<Account> updatedAccounts = [
+        SELECT Id, Score__c FROM Account WHERE Id IN :accountIds
+    ];
+    Assert.areEqual(200, updatedAccounts.size(), '全200件が処理されていること');
+    for (Account acc : updatedAccounts) {
+        Assert.isNotNull(acc.Score__c, 'すべてのAccountにスコアが設定されていること');
+    }
+}
+```
+
+### パターン3: HttpCalloutMock（外部連携テスト）
+
+```apex
+@IsTest
+private class CreditCheckServiceTest {
+
+    // Mockクラス
+    private class CreditCheckMock implements HttpCalloutMock {
+        private Integer statusCode;
+        private String body;
+
+        CreditCheckMock(Integer statusCode, String body) {
+            this.statusCode = statusCode;
+            this.body = body;
+        }
+
+        public HttpResponse respond(HttpRequest req) {
+            HttpResponse res = new HttpResponse();
+            res.setStatusCode(this.statusCode);
+            res.setBody(this.body);
+            res.setHeader('Content-Type', 'application/json');
+            return res;
+        }
+    }
+
+    @IsTest
+    static void checkCredit_successResponse_returnsScore() {
+        // Arrange
+        String mockBody = '{"score": 85, "grade": "A"}';
+        Test.setMock(HttpCalloutMock.class, new CreditCheckMock(200, mockBody));
+
+        // Act
+        Test.startTest();
+        CreditCheckResult result = CreditCheckService.checkCredit('ACC-001');
+        Test.stopTest();
+
+        // Assert
+        Assert.areEqual(85, result.score);
+        Assert.areEqual('A', result.grade);
+    }
+
+    @IsTest
+    static void checkCredit_serverError_throwsIntegrationException() {
+        // Arrange
+        Test.setMock(HttpCalloutMock.class, new CreditCheckMock(500, ''));
+
+        // Act & Assert
+        try {
+            Test.startTest();
+            CreditCheckService.checkCredit('ACC-001');
+            Test.stopTest();
+            Assert.fail('IntegrationExceptionがスローされるべき');
+        } catch (IntegrationException e) {
+            Assert.isTrue(e.getMessage().contains('500'));
+        }
+    }
+}
+```
+
+### パターン4: 権限テスト（System.runAs）
+
+```apex
+@IsTest
+static void viewScore_readOnlyUser_canViewScore() {
+    // Arrange
+    Account acc = [SELECT Id FROM Account LIMIT 1];
+    User readOnlyUser = TestDataFactory.createUserWithProfile('Standard User');
+
+    // 権限セットを付与
+    PermissionSet ps = [SELECT Id FROM PermissionSet WHERE Name = 'PS_ScoreViewer'];
+    insert new PermissionSetAssignment(
+        AssigneeId = readOnlyUser.Id,
+        PermissionSetId = ps.Id
+    );
+
+    // Act & Assert
+    System.runAs(readOnlyUser) {
+        Test.startTest();
+        Account result = [
+            SELECT Id, Score__c FROM Account
+            WHERE Id = :acc.Id
+            WITH USER_MODE
+        ];
+        Test.stopTest();
+        Assert.isNotNull(result.Score__c, '閲覧権限を持つユーザーはスコアを参照できること');
+    }
+}
+
+@IsTest
+static void editScore_readOnlyUser_throwsException() {
+    // Arrange
+    Account acc = [SELECT Id, Score__c FROM Account LIMIT 1];
+    User readOnlyUser = TestDataFactory.createUserWithProfile('Read Only');
+
+    // Act & Assert
+    System.runAs(readOnlyUser) {
+        try {
+            acc.Score__c = 99;
+            update acc;
+            Assert.fail('編集権限なしユーザーはスコアを更新できないはず');
+        } catch (DmlException e) {
+            Assert.isTrue(
+                e.getMessage().contains('INSUFFICIENT_ACCESS')
+                || e.getMessage().contains('FIELD_INTEGRITY_EXCEPTION'),
+                '権限不足のエラーが返されること'
+            );
+        }
+    }
+}
+```
+
+## テストメソッド命名規約
+
+```
+{テスト対象メソッド}_{条件}_{期待結果}
+
+例:
+calculateScore_validAccount_returnsExpectedScore
+calculateScore_noActivities_returnsZero
+calculateScore_invalidId_throwsException
+calculateScore_bulk200_completesWithinLimits
+checkCredit_serverError_throwsIntegrationException
+viewScore_readOnlyUser_canViewScore
+```
+
+## テスト設計チェックリスト
+
+```
+テスト作成時に以下を確認:
+│
+├─ テストデータ
+│   ├─ @TestSetup を使用しているか
+│   ├─ SeeAllData=true を使用していないか（禁止）
+│   ├─ ハードコードIDを使用していないか（禁止）
+│   └─ TestDataFactory を使用しているか
+│
+├─ テストカバレッジ
+│   ├─ 正常系テスト → 全メインパスをカバー
+│   ├─ 異常系テスト → 例外・バリデーション違反をカバー
+│   ├─ バルクテスト → 200件以上でのバルク動作を検証
+│   └─ セキュリティテスト → FLS/共有ルールの遵守を検証
+│
+├─ Assertの品質
+│   ├─ 各テストメソッドに最低1つの Assert があるか
+│   ├─ Assert にメッセージ（第3引数）を付与しているか
+│   └─ 戻り値だけでなく副作用（DB変更等）も検証しているか
+│
+└─ 非同期テスト
+    ├─ Test.startTest() / Test.stopTest() を使用しているか
+    ├─ Batch → executeBatch 後の stopTest でデータ検証
+    └─ Callout → Test.setMock を設定しているか
+```
+
+## 詳細リファレンスへの誘導
+
+- 正常系/異常系/バルク/セキュリティテストの完全コード例 → `reference/test-code-examples.md`
+- テストコーディング基本ルール → `instructions/test-coding.instructions.md`（自動適用）
+- エラーハンドリングのテスト方針 → `docs/architecture/policies/error-handling-policy.md`
+```
+
+#### ディレクトリ構成
+
+```
+.github/skills/salesforce-test-patterns/
+├── SKILL.md                        # 上記の内容（約280行）
+└── reference/
+    └── test-code-examples.md       # 以下の構成で詳細コード例を収録
+```
+
+#### reference/test-code-examples.md の構成
+
+```markdown
+# テストパターン — 詳細コード例リファレンス
+
+## 1. テストデータ構築パターン
+
+### 1.1 TestDataFactory の完全実装例
+### 1.2 @TestSetup の設計パターン（単純/複合シナリオ）
+### 1.3 カスタムメタデータ型のテストデータ構築
+### 1.4 StaticResource を使ったテストデータ
+
+## 2. 正常系テストの完全例
+
+### 2.1 トリガテスト（Before/After の各イベント）
+### 2.2 Serviceクラステスト
+### 2.3 Selectorクラステスト
+### 2.4 LWCコントローラテスト
+
+## 3. 異常系テストの完全例
+
+### 3.1 バリデーションルール違反テスト
+### 3.2 カスタム例外テスト
+### 3.3 AuraHandledException テスト
+### 3.4 ガバナ制限超過テスト
+
+## 4. バルクテストの完全例
+
+### 4.1 Trigger バルクテスト（200件 insert/update/delete）
+### 4.2 Batch Apex テスト
+### 4.3 Queueable テスト
+
+## 5. セキュリティテストの完全例
+
+### 5.1 FLS テスト（WITH USER_MODE 検証）
+### 5.2 共有ルールテスト（with sharing 検証）
+### 5.3 プロファイル別アクセステスト
+
+## 6. 外部連携テストの完全例
+
+### 6.1 単一エンドポイント Mock
+### 6.2 マルチエンドポイント Mock（MultiStaticResourceCalloutMock）
+### 6.3 コールアウトリトライのテスト
+### 6.4 Queueable + Callout の組合せテスト
+```
 
 ### 7-7. Skills管理ポリシー
 
